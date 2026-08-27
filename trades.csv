@@ -1,1 +1,1 @@
-date,ticker,direction,price,pnl
+date,ticker,direction,price_aud,fx_rate,pnl_jpy
