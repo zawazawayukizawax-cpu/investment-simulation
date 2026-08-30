@@ -4,7 +4,14 @@
 サブエージェント群を定義したものです。全自動の発注システムではありません。
 
 - 対象口座: 豪ドル建てデイトレード口座（資金100万円相当）
-- 実際の発注判断と結果の責任は利用者に帰属します。エージェントは発注を行いません。
+- 実際の発注判断と結果の責任は利用者に帰属します。screener-agent〜risk-managerの
+  各エージェントは発注を行いません。
+- `execution-guard` のみ、全ゲート通過後にMoomoo Trade API（**SIMULATE固定**、
+  ペーパートレード）へ発注できます。REAL（実弾）への切り替えはコードに実装されて
+  おらず、有効化するには利用者の明示的な指示が必要です。
+- 現状、このペーパー口座はASX(AU)・US市場のAPI発注を受け付けません
+  （`.claude/agents/execution-guard.md` の「口座と市場の制約」参照）。
+  ASXでの実発注確認は、口座側の権限が有効になってから行います。
 - 利用者の長期保有ポートフォリオ（PLS/WDS/IGO等）はこの仕組みの対象外です。
   優先・限定・除外のいずれの特別扱いも行いません。
 
@@ -105,7 +112,7 @@ execution-guardの判定不能ルールに従います。
 | 4 | `macro-gate` | 中銀イベント日の判定とロット半減 | WebSearch, WebFetch |
 | 5 | `signal-agent` | 統合と最終候補の絞り込み | WebSearch |
 | 6 | `risk-manager` | 損失上限とロットサイズの管理 | Read |
-| 7 | `execution-guard` | 発注直前の最終ゲート（重複発注・上限・停止指示） | Read, Write |
+| 7 | `execution-guard` | 発注直前の最終ゲート＋Moomoo Trade API(SIMULATE限定)への発注 | Read, Write, Bash |
 | 8 | `trade-logger` | 取引記録と勝率・期待値の集計 | Read, Write, Edit |
 
 定義は `.claude/agents/` にあります。各エージェントの詳細な判断基準は各ファイルを参照してください。
