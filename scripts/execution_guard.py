@@ -16,17 +16,25 @@ trd_env は _trd_env() 内の ft.TrdEnv.SIMULATE にハードコードされて�
     - common/constant.py (TrdEnv, OrderType, TrdSide, ModifyOrderOp)
 
 実機確認済みの制約（2026-08-30、公式チュートリアルには出てこない可能性がある）:
-  - このOpenD配下のペーパー口座では、ASX(AU)・US市場の銘柄はAPI発注を
-    受け付けない。
       acc_id 433736 (HK, acc_type=CASH, trdmarket_auth=['HK']) → HK銘柄のみ発注可
-      acc_id 433735 (US, acc_type=MARGIN, trdmarket_auth=['US']) → US銘柄は発注可だが
-        acc_type=MARGINのため「信用取引でないこと」の要件と両立しない
-      AU向けのペーパー口座は get_acc_list(filter_trdmarket=TrdMarket.AU) で
-        1件も返らず、存在しない。
-  - したがって現時点でこのスクリプトはASX実発注の動作確認には使えない。
-    今回はHK銘柄(acc 433736)でexecution-guard→API→発注→キャンセルの
-    配線そのものを検証する。ASXでの実発注確認は、口座側でAU市場のAPI
-    取引権限が有効になってから改めて行うこと。
+      acc_id 433735 (US, acc_type=MARGIN, trdmarket_auth=['US']) → US銘柄を発注可
+
+  - 信用取引の禁止は「口座種別(acc_type)」ではなく「取引内容」で担保する。
+    acc_type==CASH を要求する旧判定は廃止した。MARGIN表示の口座でも、
+    空売りをせず現金の範囲内でロングするだけなら信用取引にはならないため、
+    acc_type による一律拒否はUS口座(433735)を使えなくするだけで安全性に寄与しない。
+    代わりに次の2つで担保する。
+      確認1: ショート禁止  … direction=short を acc_type に関わらず無条件で拒否。
+                           closeも同様で、保有していない銘柄・保有数量を超える
+                           closeは新規の空売りになるため拒否する
+      確認6: 現金残高      … 必要現金(数量×価格, USD)を現金残高(cash)で賄えるか
+    確認6では accinfo_query の 'power'(買付余力)を使わない。買付余力は信用枠を
+    含むため、これを基準にすると信用取引を許すことになる。
+    列名は当該SDKの open_trade_context.accinfo_query の col_list で確認済み
+    ('power', 'max_power_short', ..., 'cash', ..., 'us_cash', ...)。
+
+  - 確認1〜5（ショート禁止・停止指示・重複・ポジション上限・日次損失上限）はAPI接続
+    なしで動作するため、OpenDに繋がらない環境でもロジックの検証に使える。
 
 このスクリプトが行う確認は .claude/agents/execution-guard.md の記述と
 必ず一致させること。片方だけ変更しないこと。
@@ -49,7 +57,9 @@ EXECUTION_LOG = os.path.join(REPO_ROOT, "execution_log.csv")
 GUARD_STATE = os.path.join(REPO_ROOT, "guard_state.json")
 TRADES_CSV = os.path.join(REPO_ROOT, "trades.csv")
 
-SYDNEY = ZoneInfo("Australia/Sydney")
+# 対象市場は米国（NASDAQ/NYSE）。「本日」はET基準のレギュラー取引日で判定する。
+# CLAUDE.md / risk-manager.md / trade-logger.md と同じ基準。
+NEW_YORK = ZoneInfo("America/New_York")
 
 # CLAUDE.md / risk-manager.md / execution-guard.md と同じ値。
 # 変更する場合は3ファイルすべてを揃えること。
@@ -63,8 +73,8 @@ def _trd_env():
     return ft.TrdEnv.SIMULATE
 
 
-def _now_sydney():
-    return datetime.now(SYDNEY)
+def _now_et():
+    return datetime.now(NEW_YORK)
 
 
 # --- guard_state.json（停止/再開） -----------------------------------------
@@ -85,7 +95,7 @@ def save_guard_state(state):
 def set_stopped(reason):
     save_guard_state({
         "status": "STOPPED",
-        "updated_at": _now_sydney().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": _now_et().strftime("%Y-%m-%d %H:%M:%S"),
         "reason": reason or "利用者指示（理由未記載）",
     })
 
@@ -93,7 +103,7 @@ def set_stopped(reason):
 def set_resumed():
     save_guard_state({
         "status": "ACTIVE",
-        "updated_at": _now_sydney().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": _now_et().strftime("%Y-%m-%d %H:%M:%S"),
         "reason": None,
     })
 
@@ -112,12 +122,12 @@ def check_stop():
 def check_duplicate(ticker):
     if not os.path.exists(EXECUTION_LOG):
         return True, "該当なし（ログなし）"
-    cutoff = _now_sydney() - timedelta(minutes=DUPLICATE_WINDOW_MINUTES)
+    cutoff = _now_et() - timedelta(minutes=DUPLICATE_WINDOW_MINUTES)
     with open(EXECUTION_LOG, "r", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
             if row.get("ticker") != ticker or row.get("decision") != "発注可":
                 continue
-            ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=SYDNEY)
+            ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=NEW_YORK)
             if ts >= cutoff:
                 return False, f"該当（前回発注可: {row['timestamp']}）"
     return True, "該当なし"
@@ -134,11 +144,12 @@ def check_position_cap(qty, price, fx_rate_to_jpy):
 # --- 確認4: 日次損失上限 ------------------------------------------------------
 
 def todays_pnl_jpy():
-    """risk-manager.md と同じロジック: trades.csv の date列(シドニー時間の約定日)が
-    本日と一致する行の pnl_jpy を合計する。"""
+    """risk-manager.md と同じロジック: trades.csv の date列(ET基準の約定日)が
+    本日と一致する行の pnl_jpy を合計する。
+    日本時間で日付を跨いでも、ET基準で同一取引日なら同じ日として合算される。"""
     if not os.path.exists(TRADES_CSV):
         return 0.0, "trades.csvなし"
-    today = _now_sydney().strftime("%Y-%m-%d")
+    today = _now_et().strftime("%Y-%m-%d")
     total = 0.0
     n = 0
     with open(TRADES_CSV, "r", encoding="utf-8", newline="") as f:
@@ -156,7 +167,73 @@ def check_daily_loss_limit():
     return True, f"当日損失合計 ¥{total:,.0f}（{detail}）、残り¥{DAILY_LOSS_LIMIT_JPY + total:,.0f}"
 
 
-# --- 確認5: 信用取引でないこと / 確認6: SIMULATE確認 ------------------------
+# --- 確認1: ショート禁止 ------------------------------------------------------
+
+def check_no_short(direction):
+    """空売りを口座種別に関わらず一律で禁止する。
+
+    これは acc_type による判定の代替であり、最も先に評価する。
+    acc_type=MARGIN の口座でも、現金の範囲内でロング(BUY)のみを行う限りは
+    信用取引にならないため、口座種別ではなく「取引内容」で担保する設計に変更した。
+    したがってショートの遮断は、この関数が唯一の防波堤である。緩めないこと。
+    """
+    if direction == "short":
+        return False, "direction=short（空売りは口座種別に関わらず禁止）"
+    if direction != "long":
+        return False, f"direction={direction}（long以外は不可）"
+    return True, "direction=long"
+
+
+def check_close_is_not_short(trd_ctx, acc_id, ticker, qty):
+    """closeが新規ショートにならないことを確認する（確認1のclose版）。
+
+    closeは反対売買(SELL)を送るため、ポジションを保有していない銘柄に対して
+    実行すると新規の空売りになる。保有数量を超えるcloseも同様に、超過分が
+    ショートになる。したがってcloseの前段でも確認1と同じ禁止を適用する。
+
+    列名は当該SDKの open_trade_context.position_list_query の col_list で確認済み
+    ("code", "qty", "can_sell_qty", "position_side", ...)。
+    """
+    ret, data = trd_ctx.position_list_query(
+        code=ticker, trd_env=_trd_env(), acc_id=acc_id, refresh_cache=True)
+    if ret != ft.RET_OK:
+        return False, f"判定不能: position_list_query失敗: {data}"
+
+    rows = data[data["code"] == ticker]
+    if len(rows) == 0:
+        return False, (f"{ticker} の保有ポジションなし"
+                       "（closeは新規の空売りになるため不可）")
+
+    row = rows.iloc[0]
+    try:
+        held = float(row["qty"])
+    except (TypeError, ValueError):
+        return False, f"判定不能: {ticker} の保有数量を取得できません"
+
+    if held <= 0:
+        return False, (f"{ticker} の保有数量が {held:g}"
+                       "（closeは新規の空売りになるため不可）")
+
+    side = row["position_side"] if "position_side" in data.columns else None
+    if side is not None and str(side).upper().endswith("SHORT"):
+        return False, (f"{ticker} は既にショートポジション（position_side={side}）。"
+                       "closeはSELLを送るため、ショートを増やすことになり不可")
+
+    sellable = held
+    if "can_sell_qty" in data.columns:
+        try:
+            sellable = min(held, float(row["can_sell_qty"]))
+        except (TypeError, ValueError):
+            pass
+
+    if qty > sellable:
+        return False, (f"close数量 {qty:g} が売却可能数量 {sellable:g} を超過"
+                       f"（保有 {held:g}）。超過分が新規の空売りになるため不可")
+
+    return True, f"保有 {held:g}（売却可能 {sellable:g}）、close数量 {qty:g} は範囲内"
+
+
+# --- 確認6: 現金残高 / 確認7: SIMULATE確認 ----------------------------------
 
 def _acc_row(trd_ctx, acc_id):
     ret, data = trd_ctx.get_acc_list()
@@ -168,13 +245,46 @@ def _acc_row(trd_ctx, acc_id):
     return rows.iloc[0], None
 
 
-def check_not_margin(trd_ctx, acc_id):
-    row, err = _acc_row(trd_ctx, acc_id)
-    if row is None:
-        return False, err
-    if row["acc_type"] != "CASH":
-        return False, f"acc_type={row['acc_type']}（信用口座のため不可）"
-    return True, "acc_type=CASH"
+def _cash_balance(trd_ctx, acc_id):
+    """口座の現金残高(USD)を返す。
+
+    accinfo_query の 'power'(買付余力) は信用枠を含むため使わない。
+    現金そのものを表す 'cash' を用い、取得できない場合は 'us_cash' で補う。
+    列名は moomoo SDK の open_trade_context.accinfo_query の col_list で確認済み。
+    """
+    ret, data = trd_ctx.accinfo_query(
+        trd_env=_trd_env(), acc_id=acc_id, currency=ft.Currency.USD,
+        refresh_cache=True,
+    )
+    if ret != ft.RET_OK:
+        return None, f"accinfo_query失敗: {data}"
+    row = data.iloc[0]
+    for col in ("cash", "us_cash"):
+        if col in data.columns:
+            try:
+                value = float(row[col])
+            except (TypeError, ValueError):
+                continue
+            if value == value:  # NaNでない
+                return value, col
+    return None, "現金残高の列(cash / us_cash)を取得できません"
+
+
+def check_cash_balance(trd_ctx, acc_id, qty, price):
+    """必要現金(USD)を口座の現金残高(USD)で賄えるかを判定する。
+
+    必要現金 = 数量 × 価格。為替を挟むと換算誤差が入るため、
+    比較は建玉と同じ通貨(USD)で行う。円建ての上限判定は確認4が担当する。
+    """
+    required_usd = qty * price
+    cash, detail = _cash_balance(trd_ctx, acc_id)
+    if cash is None:
+        return False, f"判定不能: {detail}"
+    if cash < required_usd:
+        return False, (f"現金残高 ${cash:,.2f}（{detail}）< 必要現金 ${required_usd:,.2f}"
+                       "（信用枠を使わずに約定できないため不可）")
+    return True, (f"現金残高 ${cash:,.2f}（{detail}）>= 必要現金 ${required_usd:,.2f}"
+                  f"、残り ${cash - required_usd:,.2f}")
 
 
 def check_trd_env_is_simulate(trd_ctx, acc_id):
@@ -188,36 +298,42 @@ def check_trd_env_is_simulate(trd_ctx, acc_id):
 
 # --- 全チェック実行 -----------------------------------------------------------
 
-def run_checks(trd_ctx, acc_id, ticker, qty, price, fx_rate_to_jpy):
+def run_checks(trd_ctx, acc_id, ticker, direction, qty, price, fx_rate_to_jpy):
     results = []
 
+    # 確認1はAPI接続もファイル読み込みも不要なため、必ず最初に評価する。
+    ok, msg = check_no_short(direction)
+    results.append(("確認1:ショート禁止", ok, msg))
+    if not ok:
+        return False, results, 0.0
+
     ok, msg = check_stop()
-    results.append(("確認1:停止状態", ok, msg))
+    results.append(("確認2:停止状態", ok, msg))
     if not ok:
         return False, results, 0.0
 
     ok, msg = check_duplicate(ticker)
-    results.append(("確認2:重複発注", ok, msg))
+    results.append(("確認3:重複発注", ok, msg))
     if not ok:
         return False, results, 0.0
 
     ok, msg, value_jpy = check_position_cap(qty, price, fx_rate_to_jpy)
-    results.append(("確認3:ポジション上限", ok, msg))
+    results.append(("確認4:ポジション上限", ok, msg))
     if not ok:
         return False, results, value_jpy
 
     ok, msg = check_daily_loss_limit()
-    results.append(("確認4:日次損失上限", ok, msg))
+    results.append(("確認5:日次損失上限", ok, msg))
     if not ok:
         return False, results, value_jpy
 
-    ok, msg = check_not_margin(trd_ctx, acc_id)
-    results.append(("確認5:信用取引でないこと", ok, msg))
+    ok, msg = check_cash_balance(trd_ctx, acc_id, qty, price)
+    results.append(("確認6:現金残高", ok, msg))
     if not ok:
         return False, results, value_jpy
 
     ok, msg = check_trd_env_is_simulate(trd_ctx, acc_id)
-    results.append(("確認6:SIMULATE確認", ok, msg))
+    results.append(("確認7:SIMULATE確認", ok, msg))
     if not ok:
         return False, results, value_jpy
 
@@ -229,10 +345,10 @@ def log_execution(ticker, direction, qty, price, position_value_jpy, decision, r
     with open(EXECUTION_LOG, "a", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         if not exists:
-            w.writerow(["timestamp", "ticker", "direction", "qty", "price_aud",
-                        "position_value_aud", "decision", "reason"])
+            w.writerow(["timestamp", "ticker", "direction", "qty", "price_usd",
+                        "position_value_jpy", "decision", "reason"])
         w.writerow([
-            _now_sydney().strftime("%Y-%m-%d %H:%M:%S"),
+            _now_et().strftime("%Y-%m-%d %H:%M:%S"),
             ticker, direction, qty, price,
             f"{position_value_jpy:.0f}", decision, reason,
         ])
@@ -242,7 +358,8 @@ def place_order_guarded(acc_id, ticker, direction, qty, price, fx_rate_to_jpy):
     """全チェックを通過した場合のみ、SIMULATE環境で成行注文を出す。"""
     trd_ctx = ft.OpenSecTradeContext(host=HOST, port=PORT)
     try:
-        ok, results, value_jpy = run_checks(trd_ctx, acc_id, ticker, qty, price, fx_rate_to_jpy)
+        ok, results, value_jpy = run_checks(
+            trd_ctx, acc_id, ticker, direction, qty, price, fx_rate_to_jpy)
         for name, c_ok, msg in results:
             print(f"[{'OK' if c_ok else 'NG'}] {name}: {msg}")
 
@@ -299,9 +416,21 @@ def cancel_order(acc_id, order_id):
 
 
 def close_position_market(acc_id, ticker, qty, price):
-    """反対売買（成行SELL）でポジションを手仕舞いする。"""
+    """反対売買（成行SELL）でポジションを手仕舞いする。
+
+    発注前に確認1(ショート禁止)のclose版を適用する。保有していない銘柄、
+    保有数量を超える数量のcloseは、新規の空売りになるため拒否する。
+    """
     trd_ctx = ft.OpenSecTradeContext(host=HOST, port=PORT)
     try:
+        ok, msg = check_close_is_not_short(trd_ctx, acc_id, ticker, qty)
+        print(f"[{'OK' if ok else 'NG'}] 確認1:ショート禁止(close): {msg}")
+        if not ok:
+            log_execution(ticker, "close", qty, price, 0.0, "発注不可",
+                          f"確認1:ショート禁止(close): {msg}")
+            print("最終判定: 発注不可")
+            return ft.RET_ERROR, msg
+
         ret, data = trd_ctx.place_order(
             price=price,
             qty=qty,
@@ -319,10 +448,13 @@ def close_position_market(acc_id, ticker, qty, price):
 
 # --- CLI ---------------------------------------------------------------------
 # execution-guardエージェント（.claude/agents/execution-guard.md）はBashツールから
-# このCLIを呼び出す。acc_idを省略した場合、現時点でAPI発注が可能な唯一の口座である
-# HK/CASH口座(433736)をデフォルトとする。ASX(AU)・US向けの口座は上記docstring参照。
+# このCLIを呼び出す。対象市場は米国(NASDAQ/NYSE)のため、US銘柄を扱える
+# US口座(433735)をデフォルトとする。
+# acc_type=MARGIN だが、確認1(ショート禁止)と確認6(現金残高)により、
+# 信用枠を使う取引はこのゲートを通過しない。上記docstring参照。
+# HK銘柄で配線を検証する場合のみ --acc-id 433736 を明示的に指定すること。
 
-DEFAULT_ACC_ID = 433736
+DEFAULT_ACC_ID = 433735
 
 
 def _build_parser():
@@ -338,7 +470,7 @@ def _build_parser():
         sp.add_argument("--qty", type=float, required=True)
         sp.add_argument("--price", type=float, required=True)
         sp.add_argument("--fx-rate", type=float, required=True,
-                         help="対象銘柄の通貨からJPYへの換算レート（ASXならAUD/JPY）")
+                         help="対象銘柄の通貨からJPYへの換算レート（米国株ならUSD/JPY）")
 
     add_order_args(sub.add_parser("check", help="発注はせず全チェックのみ行う"))
     add_order_args(sub.add_parser("place", help="全チェック通過後、SIMULATE環境で成行発注する"))
@@ -372,7 +504,8 @@ def main(argv=None):
         trd_ctx = ft.OpenSecTradeContext(host=HOST, port=PORT)
         try:
             ok, results, value_jpy = run_checks(
-                trd_ctx, args.acc_id, args.ticker, args.qty, args.price, args.fx_rate)
+                trd_ctx, args.acc_id, args.ticker, args.direction,
+                args.qty, args.price, args.fx_rate)
         finally:
             trd_ctx.close()
         for name, c_ok, msg in results:
