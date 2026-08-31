@@ -1,1 +1,1 @@
-timestamp,ticker,direction,qty,price_aud,position_value_aud,decision,reason
+timestamp,ticker,direction,qty,price_usd,position_value_jpy,decision,reason

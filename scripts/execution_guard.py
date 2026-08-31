@@ -16,17 +16,19 @@ trd_env は _trd_env() 内の ft.TrdEnv.SIMULATE にハードコードされて�
     - common/constant.py (TrdEnv, OrderType, TrdSide, ModifyOrderOp)
 
 実機確認済みの制約（2026-08-30、公式チュートリアルには出てこない可能性がある）:
-  - このOpenD配下のペーパー口座では、ASX(AU)・US市場の銘柄はAPI発注を
-    受け付けない。
+  - このOpenD配下のペーパー口座では、US市場の銘柄をこのゲートの要件どおりに
+    発注することができない。
       acc_id 433736 (HK, acc_type=CASH, trdmarket_auth=['HK']) → HK銘柄のみ発注可
       acc_id 433735 (US, acc_type=MARGIN, trdmarket_auth=['US']) → US銘柄は発注可だが
-        acc_type=MARGINのため「信用取引でないこと」の要件と両立しない
-      AU向けのペーパー口座は get_acc_list(filter_trdmarket=TrdMarket.AU) で
-        1件も返らず、存在しない。
-  - したがって現時点でこのスクリプトはASX実発注の動作確認には使えない。
+        acc_type=MARGINのため「信用取引でないこと」（確認5）で必ず拒否される
+  - *** 米国市場移行後の未解決の制約 ***
+    対象市場が米国になったが、US銘柄を扱える口座(433735)はMARGINであり、
+    確認5を通過できない。CASHのUS口座が用意されるまで、このスクリプトから
+    米国株を実発注することはできない。
+    確認1〜4（停止指示・重複・ポジション上限・日次損失上限）はAPI接続なしで
+    動作するため、ロジックの検証には引き続き使える。
     今回はHK銘柄(acc 433736)でexecution-guard→API→発注→キャンセルの
-    配線そのものを検証する。ASXでの実発注確認は、口座側でAU市場のAPI
-    取引権限が有効になってから改めて行うこと。
+    配線そのものを検証している。
 
 このスクリプトが行う確認は .claude/agents/execution-guard.md の記述と
 必ず一致させること。片方だけ変更しないこと。
@@ -49,7 +51,9 @@ EXECUTION_LOG = os.path.join(REPO_ROOT, "execution_log.csv")
 GUARD_STATE = os.path.join(REPO_ROOT, "guard_state.json")
 TRADES_CSV = os.path.join(REPO_ROOT, "trades.csv")
 
-SYDNEY = ZoneInfo("Australia/Sydney")
+# 対象市場は米国（NASDAQ/NYSE）。「本日」はET基準のレギュラー取引日で判定する。
+# CLAUDE.md / risk-manager.md / trade-logger.md と同じ基準。
+NEW_YORK = ZoneInfo("America/New_York")
 
 # CLAUDE.md / risk-manager.md / execution-guard.md と同じ値。
 # 変更する場合は3ファイルすべてを揃えること。
@@ -63,8 +67,8 @@ def _trd_env():
     return ft.TrdEnv.SIMULATE
 
 
-def _now_sydney():
-    return datetime.now(SYDNEY)
+def _now_et():
+    return datetime.now(NEW_YORK)
 
 
 # --- guard_state.json（停止/再開） -----------------------------------------
@@ -85,7 +89,7 @@ def save_guard_state(state):
 def set_stopped(reason):
     save_guard_state({
         "status": "STOPPED",
-        "updated_at": _now_sydney().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": _now_et().strftime("%Y-%m-%d %H:%M:%S"),
         "reason": reason or "利用者指示（理由未記載）",
     })
 
@@ -93,7 +97,7 @@ def set_stopped(reason):
 def set_resumed():
     save_guard_state({
         "status": "ACTIVE",
-        "updated_at": _now_sydney().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": _now_et().strftime("%Y-%m-%d %H:%M:%S"),
         "reason": None,
     })
 
@@ -112,12 +116,12 @@ def check_stop():
 def check_duplicate(ticker):
     if not os.path.exists(EXECUTION_LOG):
         return True, "該当なし（ログなし）"
-    cutoff = _now_sydney() - timedelta(minutes=DUPLICATE_WINDOW_MINUTES)
+    cutoff = _now_et() - timedelta(minutes=DUPLICATE_WINDOW_MINUTES)
     with open(EXECUTION_LOG, "r", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
             if row.get("ticker") != ticker or row.get("decision") != "発注可":
                 continue
-            ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=SYDNEY)
+            ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=NEW_YORK)
             if ts >= cutoff:
                 return False, f"該当（前回発注可: {row['timestamp']}）"
     return True, "該当なし"
@@ -134,11 +138,12 @@ def check_position_cap(qty, price, fx_rate_to_jpy):
 # --- 確認4: 日次損失上限 ------------------------------------------------------
 
 def todays_pnl_jpy():
-    """risk-manager.md と同じロジック: trades.csv の date列(シドニー時間の約定日)が
-    本日と一致する行の pnl_jpy を合計する。"""
+    """risk-manager.md と同じロジック: trades.csv の date列(ET基準の約定日)が
+    本日と一致する行の pnl_jpy を合計する。
+    日本時間で日付を跨いでも、ET基準で同一取引日なら同じ日として合算される。"""
     if not os.path.exists(TRADES_CSV):
         return 0.0, "trades.csvなし"
-    today = _now_sydney().strftime("%Y-%m-%d")
+    today = _now_et().strftime("%Y-%m-%d")
     total = 0.0
     n = 0
     with open(TRADES_CSV, "r", encoding="utf-8", newline="") as f:
@@ -229,10 +234,10 @@ def log_execution(ticker, direction, qty, price, position_value_jpy, decision, r
     with open(EXECUTION_LOG, "a", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         if not exists:
-            w.writerow(["timestamp", "ticker", "direction", "qty", "price_aud",
-                        "position_value_aud", "decision", "reason"])
+            w.writerow(["timestamp", "ticker", "direction", "qty", "price_usd",
+                        "position_value_jpy", "decision", "reason"])
         w.writerow([
-            _now_sydney().strftime("%Y-%m-%d %H:%M:%S"),
+            _now_et().strftime("%Y-%m-%d %H:%M:%S"),
             ticker, direction, qty, price,
             f"{position_value_jpy:.0f}", decision, reason,
         ])
@@ -319,8 +324,11 @@ def close_position_market(acc_id, ticker, qty, price):
 
 # --- CLI ---------------------------------------------------------------------
 # execution-guardエージェント（.claude/agents/execution-guard.md）はBashツールから
-# このCLIを呼び出す。acc_idを省略した場合、現時点でAPI発注が可能な唯一の口座である
-# HK/CASH口座(433736)をデフォルトとする。ASX(AU)・US向けの口座は上記docstring参照。
+# このCLIを呼び出す。acc_idを省略した場合、確認5(CASHであること)を通過できる唯一の
+# 口座であるHK/CASH口座(433736)をデフォルトとする。
+# 米国株を扱うUS口座(433735)はMARGINのため確認5で拒否される。上記docstring参照。
+# 対象市場が米国に移行しても、CASHのUS口座が用意されるまでこのデフォルトは変更しない
+# （433735に変えても確認5で必ず止まるため、実発注は成立しない）。
 
 DEFAULT_ACC_ID = 433736
 
@@ -338,7 +346,7 @@ def _build_parser():
         sp.add_argument("--qty", type=float, required=True)
         sp.add_argument("--price", type=float, required=True)
         sp.add_argument("--fx-rate", type=float, required=True,
-                         help="対象銘柄の通貨からJPYへの換算レート（ASXならAUD/JPY）")
+                         help="対象銘柄の通貨からJPYへの換算レート（米国株ならUSD/JPY）")
 
     add_order_args(sub.add_parser("check", help="発注はせず全チェックのみ行う"))
     add_order_args(sub.add_parser("place", help="全チェック通過後、SIMULATE環境で成行発注する"))
