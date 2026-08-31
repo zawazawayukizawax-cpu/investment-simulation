@@ -73,6 +73,38 @@ def _trd_env():
     return ft.TrdEnv.SIMULATE
 
 
+# ft.OpenSecTradeContext(...) の filter_trdmarket はSDK既定値が'HK'固定。
+# 指定を怠ると、他市場（US等）の口座が get_acc_list() / accinfo_query() から
+# 一切見えなくなる（2026-08-31に実機で確認: 433735(US)を指定しても
+# "Nonexisting acc_id 433735" となり、確認6が必ず失敗していた）。
+# trd_ctxを生成する箇所は必ずこの2関数のいずれかでfilter_trdmarketを明示すること。
+_MARKET_TRDMARKET = {
+    "US": ft.TrdMarket.US,
+    "HK": ft.TrdMarket.HK,
+    "AU": ft.TrdMarket.AU,
+}
+
+# acc_id -> 市場のマッピング。query/cancelはticker(銘柄)を受け取らないため、
+# acc_idから逆引きする。このペーパー環境では口座と市場が1:1で固定されている。
+_ACC_ID_TRDMARKET = {
+    433735: ft.TrdMarket.US,
+    433736: ft.TrdMarket.HK,
+}
+
+
+def _trdmarket_for_ticker(ticker):
+    market = ticker.split(".")[0] if "." in ticker else ""
+    return _MARKET_TRDMARKET.get(market, ft.TrdMarket.US)
+
+
+def _trdmarket_for_acc_id(acc_id):
+    return _ACC_ID_TRDMARKET.get(acc_id, ft.TrdMarket.US)
+
+
+def _open_trd_ctx(filter_trdmarket):
+    return ft.OpenSecTradeContext(filter_trdmarket=filter_trdmarket, host=HOST, port=PORT)
+
+
 def _now_et():
     return datetime.now(NEW_YORK)
 
@@ -356,7 +388,7 @@ def log_execution(ticker, direction, qty, price, position_value_jpy, decision, r
 
 def place_order_guarded(acc_id, ticker, direction, qty, price, fx_rate_to_jpy):
     """全チェックを通過した場合のみ、SIMULATE環境で成行注文を出す。"""
-    trd_ctx = ft.OpenSecTradeContext(host=HOST, port=PORT)
+    trd_ctx = _open_trd_ctx(_trdmarket_for_ticker(ticker))
     try:
         ok, results, value_jpy = run_checks(
             trd_ctx, acc_id, ticker, direction, qty, price, fx_rate_to_jpy)
@@ -395,7 +427,7 @@ def place_order_guarded(acc_id, ticker, direction, qty, price, fx_rate_to_jpy):
 
 
 def query_order(acc_id, order_id):
-    trd_ctx = ft.OpenSecTradeContext(host=HOST, port=PORT)
+    trd_ctx = _open_trd_ctx(_trdmarket_for_acc_id(acc_id))
     try:
         ret, data = trd_ctx.order_list_query(order_id=str(order_id), trd_env=_trd_env(), acc_id=acc_id)
         return ret, data
@@ -404,7 +436,7 @@ def query_order(acc_id, order_id):
 
 
 def cancel_order(acc_id, order_id):
-    trd_ctx = ft.OpenSecTradeContext(host=HOST, port=PORT)
+    trd_ctx = _open_trd_ctx(_trdmarket_for_acc_id(acc_id))
     try:
         ret, data = trd_ctx.modify_order(
             ft.ModifyOrderOp.CANCEL, str(order_id), 0, 0,
@@ -421,7 +453,7 @@ def close_position_market(acc_id, ticker, qty, price):
     発注前に確認1(ショート禁止)のclose版を適用する。保有していない銘柄、
     保有数量を超える数量のcloseは、新規の空売りになるため拒否する。
     """
-    trd_ctx = ft.OpenSecTradeContext(host=HOST, port=PORT)
+    trd_ctx = _open_trd_ctx(_trdmarket_for_ticker(ticker))
     try:
         ok, msg = check_close_is_not_short(trd_ctx, acc_id, ticker, qty)
         print(f"[{'OK' if ok else 'NG'}] 確認1:ショート禁止(close): {msg}")
@@ -501,7 +533,7 @@ def main(argv=None):
     args = _build_parser().parse_args(argv)
 
     if args.cmd == "check":
-        trd_ctx = ft.OpenSecTradeContext(host=HOST, port=PORT)
+        trd_ctx = _open_trd_ctx(_trdmarket_for_ticker(args.ticker))
         try:
             ok, results, value_jpy = run_checks(
                 trd_ctx, args.acc_id, args.ticker, args.direction,
