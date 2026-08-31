@@ -24,7 +24,9 @@ trd_env は _trd_env() 内の ft.TrdEnv.SIMULATE にハードコードされて�
     空売りをせず現金の範囲内でロングするだけなら信用取引にはならないため、
     acc_type による一律拒否はUS口座(433735)を使えなくするだけで安全性に寄与しない。
     代わりに次の2つで担保する。
-      確認1: ショート禁止  … direction=short を acc_type に関わらず無条件で拒否
+      確認1: ショート禁止  … direction=short を acc_type に関わらず無条件で拒否。
+                           closeも同様で、保有していない銘柄・保有数量を超える
+                           closeは新規の空売りになるため拒否する
       確認6: 現金残高      … 必要現金(数量×価格, USD)を現金残高(cash)で賄えるか
     確認6では accinfo_query の 'power'(買付余力)を使わない。買付余力は信用枠を
     含むため、これを基準にすると信用取引を許すことになる。
@@ -180,6 +182,55 @@ def check_no_short(direction):
     if direction != "long":
         return False, f"direction={direction}（long以外は不可）"
     return True, "direction=long"
+
+
+def check_close_is_not_short(trd_ctx, acc_id, ticker, qty):
+    """closeが新規ショートにならないことを確認する（確認1のclose版）。
+
+    closeは反対売買(SELL)を送るため、ポジションを保有していない銘柄に対して
+    実行すると新規の空売りになる。保有数量を超えるcloseも同様に、超過分が
+    ショートになる。したがってcloseの前段でも確認1と同じ禁止を適用する。
+
+    列名は当該SDKの open_trade_context.position_list_query の col_list で確認済み
+    ("code", "qty", "can_sell_qty", "position_side", ...)。
+    """
+    ret, data = trd_ctx.position_list_query(
+        code=ticker, trd_env=_trd_env(), acc_id=acc_id, refresh_cache=True)
+    if ret != ft.RET_OK:
+        return False, f"判定不能: position_list_query失敗: {data}"
+
+    rows = data[data["code"] == ticker]
+    if len(rows) == 0:
+        return False, (f"{ticker} の保有ポジションなし"
+                       "（closeは新規の空売りになるため不可）")
+
+    row = rows.iloc[0]
+    try:
+        held = float(row["qty"])
+    except (TypeError, ValueError):
+        return False, f"判定不能: {ticker} の保有数量を取得できません"
+
+    if held <= 0:
+        return False, (f"{ticker} の保有数量が {held:g}"
+                       "（closeは新規の空売りになるため不可）")
+
+    side = row["position_side"] if "position_side" in data.columns else None
+    if side is not None and str(side).upper().endswith("SHORT"):
+        return False, (f"{ticker} は既にショートポジション（position_side={side}）。"
+                       "closeはSELLを送るため、ショートを増やすことになり不可")
+
+    sellable = held
+    if "can_sell_qty" in data.columns:
+        try:
+            sellable = min(held, float(row["can_sell_qty"]))
+        except (TypeError, ValueError):
+            pass
+
+    if qty > sellable:
+        return False, (f"close数量 {qty:g} が売却可能数量 {sellable:g} を超過"
+                       f"（保有 {held:g}）。超過分が新規の空売りになるため不可")
+
+    return True, f"保有 {held:g}（売却可能 {sellable:g}）、close数量 {qty:g} は範囲内"
 
 
 # --- 確認6: 現金残高 / 確認7: SIMULATE確認 ----------------------------------
@@ -365,9 +416,21 @@ def cancel_order(acc_id, order_id):
 
 
 def close_position_market(acc_id, ticker, qty, price):
-    """反対売買（成行SELL）でポジションを手仕舞いする。"""
+    """反対売買（成行SELL）でポジションを手仕舞いする。
+
+    発注前に確認1(ショート禁止)のclose版を適用する。保有していない銘柄、
+    保有数量を超える数量のcloseは、新規の空売りになるため拒否する。
+    """
     trd_ctx = ft.OpenSecTradeContext(host=HOST, port=PORT)
     try:
+        ok, msg = check_close_is_not_short(trd_ctx, acc_id, ticker, qty)
+        print(f"[{'OK' if ok else 'NG'}] 確認1:ショート禁止(close): {msg}")
+        if not ok:
+            log_execution(ticker, "close", qty, price, 0.0, "発注不可",
+                          f"確認1:ショート禁止(close): {msg}")
+            print("最終判定: 発注不可")
+            return ft.RET_ERROR, msg
+
         ret, data = trd_ctx.place_order(
             price=price,
             qty=qty,
