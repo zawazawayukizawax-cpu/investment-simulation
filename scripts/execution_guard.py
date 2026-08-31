@@ -16,19 +16,23 @@ trd_env は _trd_env() 内の ft.TrdEnv.SIMULATE にハードコードされて�
     - common/constant.py (TrdEnv, OrderType, TrdSide, ModifyOrderOp)
 
 実機確認済みの制約（2026-08-30、公式チュートリアルには出てこない可能性がある）:
-  - このOpenD配下のペーパー口座では、US市場の銘柄をこのゲートの要件どおりに
-    発注することができない。
       acc_id 433736 (HK, acc_type=CASH, trdmarket_auth=['HK']) → HK銘柄のみ発注可
-      acc_id 433735 (US, acc_type=MARGIN, trdmarket_auth=['US']) → US銘柄は発注可だが
-        acc_type=MARGINのため「信用取引でないこと」（確認5）で必ず拒否される
-  - *** 米国市場移行後の未解決の制約 ***
-    対象市場が米国になったが、US銘柄を扱える口座(433735)はMARGINであり、
-    確認5を通過できない。CASHのUS口座が用意されるまで、このスクリプトから
-    米国株を実発注することはできない。
-    確認1〜4（停止指示・重複・ポジション上限・日次損失上限）はAPI接続なしで
-    動作するため、ロジックの検証には引き続き使える。
-    今回はHK銘柄(acc 433736)でexecution-guard→API→発注→キャンセルの
-    配線そのものを検証している。
+      acc_id 433735 (US, acc_type=MARGIN, trdmarket_auth=['US']) → US銘柄を発注可
+
+  - 信用取引の禁止は「口座種別(acc_type)」ではなく「取引内容」で担保する。
+    acc_type==CASH を要求する旧判定は廃止した。MARGIN表示の口座でも、
+    空売りをせず現金の範囲内でロングするだけなら信用取引にはならないため、
+    acc_type による一律拒否はUS口座(433735)を使えなくするだけで安全性に寄与しない。
+    代わりに次の2つで担保する。
+      確認1: ショート禁止  … direction=short を acc_type に関わらず無条件で拒否
+      確認6: 現金残高      … 必要現金(数量×価格, USD)を現金残高(cash)で賄えるか
+    確認6では accinfo_query の 'power'(買付余力)を使わない。買付余力は信用枠を
+    含むため、これを基準にすると信用取引を許すことになる。
+    列名は当該SDKの open_trade_context.accinfo_query の col_list で確認済み
+    ('power', 'max_power_short', ..., 'cash', ..., 'us_cash', ...)。
+
+  - 確認1〜5（ショート禁止・停止指示・重複・ポジション上限・日次損失上限）はAPI接続
+    なしで動作するため、OpenDに繋がらない環境でもロジックの検証に使える。
 
 このスクリプトが行う確認は .claude/agents/execution-guard.md の記述と
 必ず一致させること。片方だけ変更しないこと。
@@ -161,7 +165,24 @@ def check_daily_loss_limit():
     return True, f"当日損失合計 ¥{total:,.0f}（{detail}）、残り¥{DAILY_LOSS_LIMIT_JPY + total:,.0f}"
 
 
-# --- 確認5: 信用取引でないこと / 確認6: SIMULATE確認 ------------------------
+# --- 確認1: ショート禁止 ------------------------------------------------------
+
+def check_no_short(direction):
+    """空売りを口座種別に関わらず一律で禁止する。
+
+    これは acc_type による判定の代替であり、最も先に評価する。
+    acc_type=MARGIN の口座でも、現金の範囲内でロング(BUY)のみを行う限りは
+    信用取引にならないため、口座種別ではなく「取引内容」で担保する設計に変更した。
+    したがってショートの遮断は、この関数が唯一の防波堤である。緩めないこと。
+    """
+    if direction == "short":
+        return False, "direction=short（空売りは口座種別に関わらず禁止）"
+    if direction != "long":
+        return False, f"direction={direction}（long以外は不可）"
+    return True, "direction=long"
+
+
+# --- 確認6: 現金残高 / 確認7: SIMULATE確認 ----------------------------------
 
 def _acc_row(trd_ctx, acc_id):
     ret, data = trd_ctx.get_acc_list()
@@ -173,13 +194,46 @@ def _acc_row(trd_ctx, acc_id):
     return rows.iloc[0], None
 
 
-def check_not_margin(trd_ctx, acc_id):
-    row, err = _acc_row(trd_ctx, acc_id)
-    if row is None:
-        return False, err
-    if row["acc_type"] != "CASH":
-        return False, f"acc_type={row['acc_type']}（信用口座のため不可）"
-    return True, "acc_type=CASH"
+def _cash_balance(trd_ctx, acc_id):
+    """口座の現金残高(USD)を返す。
+
+    accinfo_query の 'power'(買付余力) は信用枠を含むため使わない。
+    現金そのものを表す 'cash' を用い、取得できない場合は 'us_cash' で補う。
+    列名は moomoo SDK の open_trade_context.accinfo_query の col_list で確認済み。
+    """
+    ret, data = trd_ctx.accinfo_query(
+        trd_env=_trd_env(), acc_id=acc_id, currency=ft.Currency.USD,
+        refresh_cache=True,
+    )
+    if ret != ft.RET_OK:
+        return None, f"accinfo_query失敗: {data}"
+    row = data.iloc[0]
+    for col in ("cash", "us_cash"):
+        if col in data.columns:
+            try:
+                value = float(row[col])
+            except (TypeError, ValueError):
+                continue
+            if value == value:  # NaNでない
+                return value, col
+    return None, "現金残高の列(cash / us_cash)を取得できません"
+
+
+def check_cash_balance(trd_ctx, acc_id, qty, price):
+    """必要現金(USD)を口座の現金残高(USD)で賄えるかを判定する。
+
+    必要現金 = 数量 × 価格。為替を挟むと換算誤差が入るため、
+    比較は建玉と同じ通貨(USD)で行う。円建ての上限判定は確認4が担当する。
+    """
+    required_usd = qty * price
+    cash, detail = _cash_balance(trd_ctx, acc_id)
+    if cash is None:
+        return False, f"判定不能: {detail}"
+    if cash < required_usd:
+        return False, (f"現金残高 ${cash:,.2f}（{detail}）< 必要現金 ${required_usd:,.2f}"
+                       "（信用枠を使わずに約定できないため不可）")
+    return True, (f"現金残高 ${cash:,.2f}（{detail}）>= 必要現金 ${required_usd:,.2f}"
+                  f"、残り ${cash - required_usd:,.2f}")
 
 
 def check_trd_env_is_simulate(trd_ctx, acc_id):
@@ -193,36 +247,42 @@ def check_trd_env_is_simulate(trd_ctx, acc_id):
 
 # --- 全チェック実行 -----------------------------------------------------------
 
-def run_checks(trd_ctx, acc_id, ticker, qty, price, fx_rate_to_jpy):
+def run_checks(trd_ctx, acc_id, ticker, direction, qty, price, fx_rate_to_jpy):
     results = []
 
+    # 確認1はAPI接続もファイル読み込みも不要なため、必ず最初に評価する。
+    ok, msg = check_no_short(direction)
+    results.append(("確認1:ショート禁止", ok, msg))
+    if not ok:
+        return False, results, 0.0
+
     ok, msg = check_stop()
-    results.append(("確認1:停止状態", ok, msg))
+    results.append(("確認2:停止状態", ok, msg))
     if not ok:
         return False, results, 0.0
 
     ok, msg = check_duplicate(ticker)
-    results.append(("確認2:重複発注", ok, msg))
+    results.append(("確認3:重複発注", ok, msg))
     if not ok:
         return False, results, 0.0
 
     ok, msg, value_jpy = check_position_cap(qty, price, fx_rate_to_jpy)
-    results.append(("確認3:ポジション上限", ok, msg))
+    results.append(("確認4:ポジション上限", ok, msg))
     if not ok:
         return False, results, value_jpy
 
     ok, msg = check_daily_loss_limit()
-    results.append(("確認4:日次損失上限", ok, msg))
+    results.append(("確認5:日次損失上限", ok, msg))
     if not ok:
         return False, results, value_jpy
 
-    ok, msg = check_not_margin(trd_ctx, acc_id)
-    results.append(("確認5:信用取引でないこと", ok, msg))
+    ok, msg = check_cash_balance(trd_ctx, acc_id, qty, price)
+    results.append(("確認6:現金残高", ok, msg))
     if not ok:
         return False, results, value_jpy
 
     ok, msg = check_trd_env_is_simulate(trd_ctx, acc_id)
-    results.append(("確認6:SIMULATE確認", ok, msg))
+    results.append(("確認7:SIMULATE確認", ok, msg))
     if not ok:
         return False, results, value_jpy
 
@@ -247,7 +307,8 @@ def place_order_guarded(acc_id, ticker, direction, qty, price, fx_rate_to_jpy):
     """全チェックを通過した場合のみ、SIMULATE環境で成行注文を出す。"""
     trd_ctx = ft.OpenSecTradeContext(host=HOST, port=PORT)
     try:
-        ok, results, value_jpy = run_checks(trd_ctx, acc_id, ticker, qty, price, fx_rate_to_jpy)
+        ok, results, value_jpy = run_checks(
+            trd_ctx, acc_id, ticker, direction, qty, price, fx_rate_to_jpy)
         for name, c_ok, msg in results:
             print(f"[{'OK' if c_ok else 'NG'}] {name}: {msg}")
 
@@ -324,13 +385,13 @@ def close_position_market(acc_id, ticker, qty, price):
 
 # --- CLI ---------------------------------------------------------------------
 # execution-guardエージェント（.claude/agents/execution-guard.md）はBashツールから
-# このCLIを呼び出す。acc_idを省略した場合、確認5(CASHであること)を通過できる唯一の
-# 口座であるHK/CASH口座(433736)をデフォルトとする。
-# 米国株を扱うUS口座(433735)はMARGINのため確認5で拒否される。上記docstring参照。
-# 対象市場が米国に移行しても、CASHのUS口座が用意されるまでこのデフォルトは変更しない
-# （433735に変えても確認5で必ず止まるため、実発注は成立しない）。
+# このCLIを呼び出す。対象市場は米国(NASDAQ/NYSE)のため、US銘柄を扱える
+# US口座(433735)をデフォルトとする。
+# acc_type=MARGIN だが、確認1(ショート禁止)と確認6(現金残高)により、
+# 信用枠を使う取引はこのゲートを通過しない。上記docstring参照。
+# HK銘柄で配線を検証する場合のみ --acc-id 433736 を明示的に指定すること。
 
-DEFAULT_ACC_ID = 433736
+DEFAULT_ACC_ID = 433735
 
 
 def _build_parser():
@@ -380,7 +441,8 @@ def main(argv=None):
         trd_ctx = ft.OpenSecTradeContext(host=HOST, port=PORT)
         try:
             ok, results, value_jpy = run_checks(
-                trd_ctx, args.acc_id, args.ticker, args.qty, args.price, args.fx_rate)
+                trd_ctx, args.acc_id, args.ticker, args.direction,
+                args.qty, args.price, args.fx_rate)
         finally:
             trd_ctx.close()
         for name, c_ok, msg in results:

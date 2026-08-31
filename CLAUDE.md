@@ -101,8 +101,8 @@ risk-manager は、保有中ポジションに対する売却ルールも担当�
 
 ### ステージ4.5: execution-guard
 risk-manager が発注可と判定した候補について、`execution-guard` を呼び出し、
-発注直前の最終確認（利用者の停止指示・重複発注・ポジション上限・日次損失上限の再確認）を
-行わせます。risk-manager の当日損失合計と、使用したUSD/JPYレートを必ず併せて渡してください。
+発注直前の最終確認（ショート禁止・利用者の停止指示・重複発注・ポジション上限・
+日次損失上限・現金残高・SIMULATEの7項目）を行わせます。risk-manager の当日損失合計と、使用したUSD/JPYレートを必ず併せて渡してください。
 
 execution-guard が「停止中」または「発注不可」と判定した候補は、その理由とともに
 利用者へ報告し、発注を勧めないでください。execution-guard は risk-manager の判定を
@@ -130,7 +130,7 @@ execution-guardの判定不能ルールに従います。
 | 4 | `macro-gate` | FOMC等のイベント日の判定とロット半減 | WebSearch, WebFetch |
 | 5 | `signal-agent` | 統合と最終候補の絞り込み | WebSearch |
 | 6 | `risk-manager` | 損失上限・ロットサイズ・売却ルールの管理 | Read |
-| 7 | `execution-guard` | 発注直前の最終ゲート＋Moomoo Trade API(SIMULATE限定)への発注 | Read, Write, Bash |
+| 7 | `execution-guard` | 発注直前の最終ゲート（確認1〜7）＋Moomoo Trade API(SIMULATE限定)への発注 | Read, Write, Bash |
 | 8 | `trade-logger` | 取引記録と勝率・期待値の集計 | Read, Write, Edit |
 
 定義は `.claude/agents/` にあります。各エージェントの詳細な判断基準は各ファイルを参照してください。
@@ -198,15 +198,20 @@ timestamp,ticker,direction,qty,price_usd,position_value_jpy,decision,reason
   （`EGRESS_BLOCKED`）。環境設定で **Custom** に変更し、対象ドメインを許可リストに追加すると解消します。
 - 検索結果の網羅性は保証されません。条件を満たす銘柄を取りこぼす可能性があります。
 
-## 米国市場での未解決の制約
+## 信用取引の禁止方法
 
-**US銘柄をexecution-guard経由で実発注することはできません。**
-US銘柄を扱えるペーパー口座(433735)は `acc_type=MARGIN` であり、
-確認5「信用取引でないこと」を通過できません。確認5を通過できる433736はHK専用です。
+`acc_type=MARGIN` を理由に一律拒否する旧判定は廃止しました。MARGIN表示の口座でも、
+空売りをせず現金の範囲内でロングするだけなら信用取引にはならないためです。
+口座種別ではなく**取引内容**で担保します。
 
-- 確認1〜4（停止指示・重複発注・ポジション上限・日次損失上限）はAPI接続なしで
-  動作するため、ロジックの検証には引き続き使えます。
-- CASHのUS口座が用意されたら、`.claude/agents/execution-guard.md` の口座表と
-  `scripts/execution_guard.py` の `DEFAULT_ACC_ID` を併せて更新してください。
-- **確認5を緩めて回避してはいけません。**
+| 確認 | 内容 |
+| --- | --- |
+| **確認1: ショート禁止** | `direction=short` を口座種別に関わらず無条件で拒否 |
+| **確認6: 現金残高** | 必要現金（数量×価格、USD）を現金残高で賄えるかを確認 |
+
+確認6では `accinfo_query` の `power`（買付余力）を**使いません**。買付余力は信用枠を
+含むためです。現金そのものを表す `cash`（取得できない場合は `us_cash`）で判定します。
+
+**ショートの遮断は確認1が唯一の防波堤です。緩めてはいけません。**
+既定の口座は 433735（US、SIMULATE）です。
 
