@@ -1,1 +1,2 @@
 timestamp,ticker,direction,qty,price_usd,position_value_jpy,decision,reason
+2026-08-31 09:32:12,US.AAPL,long,1.0,150.0,23250,発注可,全チェック通過
