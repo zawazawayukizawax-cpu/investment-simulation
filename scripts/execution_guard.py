@@ -473,6 +473,14 @@ def close_position_market(acc_id, ticker, qty, price):
             acc_id=acc_id,
             remark="execution-guard close",
         )
+        if ret != ft.RET_OK:
+            log_execution(ticker, "close", qty, price, 0.0, "発注不可", f"API拒否: {data}")
+            print("発注API拒否:", data)
+            return ret, data
+
+        order_id = data["order_id"].iloc[0]
+        log_execution(ticker, "close", qty, price, 0.0, "発注可", "確認1(close)通過")
+        print("最終判定: 発注可 / order_id =", order_id)
         return ret, data
     finally:
         trd_ctx.close()
