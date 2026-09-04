@@ -24,6 +24,10 @@ trd_env は _trd_env() 内の ft.TrdEnv.SIMULATE にハードコードされて�
     空売りをせず現金の範囲内でロングするだけなら信用取引にはならないため、
     acc_type による一律拒否はUS口座(433735)を使えなくするだけで安全性に寄与しない。
     代わりに次の2つで担保する。
+      確認5: 同時保有件数  … 保有3件を超える新規建てを拒否（1件1万円×3=日次上限）
+      確認6: 日次損失上限  … 実現損失 + 未決済ポジションの含みリスク + 新規リスク
+                           が3万円を超えないこと。実現損失だけを見ると、含みリスクを
+                           何件抱えても「残り3万円」になってしまうため
       確認1: ショート禁止  … direction=short を acc_type に関わらず無条件で拒否。
                            closeも同様で、保有していない銘柄・保有数量を超える
                            closeは新規の空売りになるため拒否する
@@ -56,6 +60,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXECUTION_LOG = os.path.join(REPO_ROOT, "execution_log.csv")
 GUARD_STATE = os.path.join(REPO_ROOT, "guard_state.json")
 TRADES_CSV = os.path.join(REPO_ROOT, "trades.csv")
+OPEN_POSITIONS = os.path.join(REPO_ROOT, "open_positions.json")
 
 # 対象市場は米国（NASDAQ/NYSE）。「本日」はET基準のレギュラー取引日で判定する。
 # CLAUDE.md / risk-manager.md / trade-logger.md と同じ基準。
@@ -66,6 +71,14 @@ NEW_YORK = ZoneInfo("America/New_York")
 DAILY_LOSS_LIMIT_JPY = 30_000
 POSITION_CAP_JPY = 300_000
 DUPLICATE_WINDOW_MINUTES = 5
+
+# 同時に保有できるポジション数の上限（確認5）。
+# 1件あたりの許容損失1万円 × 3件 = 日次上限3万円 に一致させている。
+MAX_OPEN_POSITIONS = 3
+
+# 1トレードあたりの許容損失（risk-manager.md と同じ値）。
+# 確認6で、損切り価格が記録されていない建玉のリスクを見積もる際の保守的な既定値。
+PER_TRADE_LOSS_LIMIT_JPY = 10_000
 
 
 def _trd_env():
@@ -192,11 +205,147 @@ def todays_pnl_jpy():
     return total, f"{n}件（{today}）"
 
 
-def check_daily_loss_limit():
-    total, detail = todays_pnl_jpy()
-    if total <= -DAILY_LOSS_LIMIT_JPY:
-        return False, f"当日損失合計 ¥{total:,.0f}（{detail}）が上限-¥{DAILY_LOSS_LIMIT_JPY:,}に到達"
-    return True, f"当日損失合計 ¥{total:,.0f}（{detail}）、残り¥{DAILY_LOSS_LIMIT_JPY + total:,.0f}"
+def check_open_position_count(trd_ctx, acc_id, ticker):
+    """同時に保有するポジション数の上限（確認5）。
+
+    1件あたり最大1万円のリスクを取るため、3件を超えると最悪ケースの合計が
+    日次上限3万円を超える。既に保有している銘柄への買い増しは件数を増やさない
+    ため許容する（その場合のリスク増は確認6が見る）。
+    """
+    held, err = _held_positions(trd_ctx, acc_id)
+    if held is None:
+        return False, f"判定不能: {err}"
+    codes = [c for c, _ in held]
+    if ticker in codes:
+        return True, f"保有 {len(codes)}件（上限{MAX_OPEN_POSITIONS}件）。{ticker} は既に保有中のため件数は増えません"
+    if len(codes) + 1 > MAX_OPEN_POSITIONS:
+        return False, (f"保有 {len(codes)}件（{', '.join(codes)}）。"
+                       f"新規1件で上限{MAX_OPEN_POSITIONS}件を超過するため不可")
+    return True, f"保有 {len(codes)}件 → {len(codes) + 1}件（上限{MAX_OPEN_POSITIONS}件）"
+
+
+def open_risk_jpy(trd_ctx, acc_id):
+    """未決済ポジションが消費している含みリスクの合計(JPY)を返す。
+
+    銘柄ごとのリスク = (エントリー価格 - 損切り価格) × 数量 × USD/JPYレート。
+    open_positions.json に記録がある建玉はその値を、記録がない建玉は
+    PER_TRADE_LOSS_LIMIT_JPY を消費しているものとして安全側に見積もる。
+    """
+    held, err = _held_positions(trd_ctx, acc_id)
+    if held is None:
+        return None, err
+    recorded = load_open_positions()
+    total = 0.0
+    details = []
+    for code, qty in held:
+        entry = recorded.get(code)
+        if entry:
+            per_share = float(entry["entry_price_usd"]) - float(entry["stop_price_usd"])
+            risk = max(0.0, per_share) * min(qty, float(entry["qty"])) * float(entry["fx_rate"])
+            details.append(f"{code} ¥{risk:,.0f}")
+        else:
+            risk = PER_TRADE_LOSS_LIMIT_JPY
+            details.append(f"{code} ¥{risk:,.0f}(損切り価格未記録のため上限で計上)")
+        total += risk
+    return total, "、".join(details) if details else "保有なし"
+
+
+def check_daily_loss_limit(trd_ctx, acc_id, qty, price, stop_price, fx_rate_to_jpy):
+    """日次損失上限（確認6）。
+
+    実現損失（trades.csv）だけでなく、未決済ポジションの含みリスクと、
+    これから建てる分のリスクも枠に算入する。実現損失しか見ないと、
+    含みリスクを何件抱えても「残り3万円」と表示されてしまうため。
+    """
+    realized, realized_detail = todays_pnl_jpy()
+    open_risk, open_detail = open_risk_jpy(trd_ctx, acc_id)
+    if open_risk is None:
+        return False, f"判定不能: {open_detail}"
+
+    new_risk = max(0.0, price - stop_price) * qty * fx_rate_to_jpy
+    realized_loss = max(0.0, -realized)   # 利益は枠を回復させない（安全側）
+    used = realized_loss + open_risk + new_risk
+    remaining = DAILY_LOSS_LIMIT_JPY - used
+
+    summary = (f"実現損失 ¥{realized_loss:,.0f}（{realized_detail}）"
+               f" + 未決済リスク ¥{open_risk:,.0f}（{open_detail}）"
+               f" + 新規リスク ¥{new_risk:,.0f} = ¥{used:,.0f}")
+    if used > DAILY_LOSS_LIMIT_JPY:
+        return False, f"{summary} が上限¥{DAILY_LOSS_LIMIT_JPY:,}を超過"
+    return True, f"{summary}、残り¥{remaining:,.0f}"
+
+
+# --- open_positions.json（建玉ごとの損切り価格の記録） ----------------------
+# 確認6で未決済ポジションの含みリスクを計算するために、placeが成功した時点の
+# エントリー価格・損切り価格・数量を記録する。closeが成功したら数量を減らす。
+# ここに記録がない建玉（このゲートを通さず手動で建てたもの等）は、確認6で
+# PER_TRADE_LOSS_LIMIT_JPY を消費しているものとして安全側に見積もる。
+
+def load_open_positions():
+    if not os.path.exists(OPEN_POSITIONS):
+        return {}
+    try:
+        with open(OPEN_POSITIONS, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_open_positions(data):
+    with open(OPEN_POSITIONS, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def record_open_position(ticker, qty, price, stop_price, fx_rate_to_jpy):
+    data = load_open_positions()
+    prev = data.get(ticker)
+    if prev:
+        # 同一銘柄への買い増し。加重平均でエントリー価格をまとめ、
+        # 損切り価格は不利なほう（高いほう＝リスクが大きいほう）を採る。
+        total_qty = float(prev["qty"]) + qty
+        price = (float(prev["entry_price_usd"]) * float(prev["qty"]) + price * qty) / total_qty
+        stop_price = min(float(prev["stop_price_usd"]), stop_price)
+        qty = total_qty
+    data[ticker] = {
+        "qty": qty,
+        "entry_price_usd": price,
+        "stop_price_usd": stop_price,
+        "fx_rate": fx_rate_to_jpy,
+        "updated_at": _now_et().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_open_positions(data)
+
+
+def forget_open_position(ticker, qty_closed):
+    data = load_open_positions()
+    entry = data.get(ticker)
+    if not entry:
+        return
+    remaining = float(entry["qty"]) - qty_closed
+    if remaining <= 0:
+        data.pop(ticker, None)
+    else:
+        entry["qty"] = remaining
+        entry["updated_at"] = _now_et().strftime("%Y-%m-%d %H:%M:%S")
+    save_open_positions(data)
+
+
+def _held_positions(trd_ctx, acc_id):
+    """保有中（qty > 0）の建玉を [(code, qty), ...] で返す。失敗時は (None, 理由)。"""
+    ret, data = trd_ctx.position_list_query(
+        trd_env=_trd_env(), acc_id=acc_id, refresh_cache=True)
+    if ret != ft.RET_OK:
+        return None, f"position_list_query失敗: {data}"
+    held = []
+    for row in data.iloc:
+        try:
+            qty = float(row["qty"])
+        except (TypeError, ValueError):
+            continue
+        if qty > 0:
+            held.append((row["code"], qty))
+    return held, None
 
 
 # --- 確認1: ショート禁止 ------------------------------------------------------
@@ -330,7 +479,7 @@ def check_trd_env_is_simulate(trd_ctx, acc_id):
 
 # --- 全チェック実行 -----------------------------------------------------------
 
-def run_checks(trd_ctx, acc_id, ticker, direction, qty, price, fx_rate_to_jpy):
+def run_checks(trd_ctx, acc_id, ticker, direction, qty, price, stop_price, fx_rate_to_jpy):
     results = []
 
     # 確認1はAPI接続もファイル読み込みも不要なため、必ず最初に評価する。
@@ -354,18 +503,24 @@ def run_checks(trd_ctx, acc_id, ticker, direction, qty, price, fx_rate_to_jpy):
     if not ok:
         return False, results, value_jpy
 
-    ok, msg = check_daily_loss_limit()
-    results.append(("確認5:日次損失上限", ok, msg))
+    ok, msg = check_open_position_count(trd_ctx, acc_id, ticker)
+    results.append(("確認5:同時保有件数", ok, msg))
+    if not ok:
+        return False, results, value_jpy
+
+    ok, msg = check_daily_loss_limit(
+        trd_ctx, acc_id, qty, price, stop_price, fx_rate_to_jpy)
+    results.append(("確認6:日次損失上限", ok, msg))
     if not ok:
         return False, results, value_jpy
 
     ok, msg = check_cash_balance(trd_ctx, acc_id, qty, price)
-    results.append(("確認6:現金残高", ok, msg))
+    results.append(("確認7:現金残高", ok, msg))
     if not ok:
         return False, results, value_jpy
 
     ok, msg = check_trd_env_is_simulate(trd_ctx, acc_id)
-    results.append(("確認7:SIMULATE確認", ok, msg))
+    results.append(("確認8:SIMULATE確認", ok, msg))
     if not ok:
         return False, results, value_jpy
 
@@ -386,12 +541,12 @@ def log_execution(ticker, direction, qty, price, position_value_jpy, decision, r
         ])
 
 
-def place_order_guarded(acc_id, ticker, direction, qty, price, fx_rate_to_jpy):
+def place_order_guarded(acc_id, ticker, direction, qty, price, stop_price, fx_rate_to_jpy):
     """全チェックを通過した場合のみ、SIMULATE環境で成行注文を出す。"""
     trd_ctx = _open_trd_ctx(_trdmarket_for_ticker(ticker))
     try:
         ok, results, value_jpy = run_checks(
-            trd_ctx, acc_id, ticker, direction, qty, price, fx_rate_to_jpy)
+            trd_ctx, acc_id, ticker, direction, qty, price, stop_price, fx_rate_to_jpy)
         for name, c_ok, msg in results:
             print(f"[{'OK' if c_ok else 'NG'}] {name}: {msg}")
 
@@ -418,6 +573,7 @@ def place_order_guarded(acc_id, ticker, direction, qty, price, fx_rate_to_jpy):
             return None
 
         order_id = data["order_id"].iloc[0]
+        record_open_position(ticker, qty, price, stop_price, fx_rate_to_jpy)
         log_execution(ticker, direction, qty, price, value_jpy, "発注可", "全チェック通過")
         print("最終判定: 発注可 / order_id =", order_id)
         print(data.to_string())
@@ -479,6 +635,7 @@ def close_position_market(acc_id, ticker, qty, price):
             return ret, data
 
         order_id = data["order_id"].iloc[0]
+        forget_open_position(ticker, qty)
         log_execution(ticker, "close", qty, price, 0.0, "発注可", "確認1(close)通過")
         print("最終判定: 発注可 / order_id =", order_id)
         return ret, data
@@ -509,6 +666,9 @@ def _build_parser():
         sp.add_argument("--direction", choices=["long", "short"], required=True)
         sp.add_argument("--qty", type=float, required=True)
         sp.add_argument("--price", type=float, required=True)
+        sp.add_argument("--stop-price", type=float, required=True,
+                         help="損切り価格(USD)。確認6で新規リスクの計算に使う。"
+                              "risk-managerが必ず提示するため必須")
         sp.add_argument("--fx-rate", type=float, required=True,
                          help="対象銘柄の通貨からJPYへの換算レート（米国株ならUSD/JPY）")
 
@@ -545,7 +705,7 @@ def main(argv=None):
         try:
             ok, results, value_jpy = run_checks(
                 trd_ctx, args.acc_id, args.ticker, args.direction,
-                args.qty, args.price, args.fx_rate)
+                args.qty, args.price, args.stop_price, args.fx_rate)
         finally:
             trd_ctx.close()
         for name, c_ok, msg in results:
@@ -554,7 +714,8 @@ def main(argv=None):
 
     elif args.cmd == "place":
         order_id = place_order_guarded(
-            args.acc_id, args.ticker, args.direction, args.qty, args.price, args.fx_rate)
+            args.acc_id, args.ticker, args.direction, args.qty, args.price,
+            args.stop_price, args.fx_rate)
         if order_id is None:
             sys.exit(1)
 
