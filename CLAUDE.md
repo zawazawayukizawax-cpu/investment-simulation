@@ -105,7 +105,9 @@ risk-manager は、保有中ポジションに対する売却ルールも担当�
 ### ステージ4.5: execution-guard
 risk-manager が発注可と判定した候補について、`execution-guard` を呼び出し、
 発注直前の最終確認（ショート禁止・利用者の停止指示・重複発注・ポジション上限・
-日次損失上限・現金残高・SIMULATEの7項目）を行わせます。risk-manager の当日損失合計と、使用したUSD/JPYレートを必ず併せて渡してください。
+同時保有件数上限・日次損失上限(含みリスク算入)・現金残高・SIMULATEの8項目）を
+行わせます。risk-manager の当日損失合計と、損切り価格、使用したUSD/JPYレートを
+必ず併せて渡してください（損切り価格は日次損失上限の含みリスク算入判定に使われます）。
 
 execution-guard が「停止中」または「発注不可」と判定した候補は、その理由とともに
 利用者へ報告し、発注を勧めないでください。execution-guard は risk-manager の判定を
@@ -133,7 +135,7 @@ execution-guardの判定不能ルールに従います。
 | 4 | `macro-gate` | FOMC等のイベント日の判定とロット半減 | WebSearch, WebFetch |
 | 5 | `signal-agent` | 統合と最終候補の絞り込み | WebSearch |
 | 6 | `risk-manager` | 損失上限・ロットサイズ・売却ルールの管理 | Read |
-| 7 | `execution-guard` | 発注直前の最終ゲート（確認1〜7）＋Moomoo Trade API(SIMULATE限定)への発注 | Read, Write, Bash |
+| 7 | `execution-guard` | 発注直前の最終ゲート（確認1〜8）＋Moomoo Trade API(SIMULATE限定)への発注 | Read, Write, Bash |
 | 8 | `trade-logger` | 取引記録と勝率・期待値の集計 | Read, Write, Edit |
 
 定義は `.claude/agents/` にあります。各エージェントの詳細な判断基準は各ファイルを参照してください。
@@ -146,6 +148,7 @@ execution-guardの判定不能ルールに従います。
 | 1トレードの許容損失 | 1万円（1%）／ロット縮小日は5千円 |
 | 日次の許容損失合計 | 3万円（3%） |
 | 1トレードの想定ポジション金額上限 | 30万円（30%、execution-guardによる計算ミス検知用） |
+| 同時保有件数上限 | 3件（1トレード1万円 × 3件 = 日次上限3万円に一致、execution-guard確認5） |
 
 「本日」は **米国レギュラー取引日（ET、米国東部時間）** を基準とします。日本時間の暦日ではありません。
 日本時間 23:00（ET 10:00）と翌 4:00（ET 15:00）は、**ET基準では同一取引日**です。
@@ -180,6 +183,18 @@ timestamp,ticker,direction,qty,price_usd,position_value_jpy,decision,reason
 
 - `execution-guard` が利用者の「停止」「再開」指示に応じて更新します
 - 日次実行手順とは無関係に、いつでも利用者の指示で変更されます
+
+`open_positions.json`（リポジトリ直下）
+
+```
+{"<ticker>": [{"qty": ..., "entry_price": ..., "stop_price": ..., "fx_rate": ...,
+               "risk_jpy": ..., "opened_at": "..."}]}
+```
+
+- `execution-guard` が保有中ポジションの含みリスク（`(entry_price − stop_price)
+  × qty × fx_rate`）を銘柄別に記録します
+- `place` 成功時に追記、`close` 成功時に減算します。人手での編集は不要です
+- 確認6（日次損失上限・含みリスク算入）の計算に使われます
 
 ## 全エージェント共通の原則
 
